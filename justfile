@@ -1,0 +1,23 @@
+toml-format:
+    @echo "Formatting TOML files..."
+    taplo format .
+
+
+fmt:
+    @echo "Formatting Rust code..."
+    cargo fmt --all
+
+# Lint with clippy
+lint:
+    @echo "Linting with clippy..."
+    cargo clippy --all-targets --all-features -- -D warnings
+
+test:
+    @echo "Running tests..."
+    cargo test --all
+
+optimize:
+    docker run --rm -v "$(pwd)":/code \
+    --mount type=volume,source="$(basename "$(pwd)")_cache",target=/target \
+    --mount type=volume,source=registry_cache,target=/usr/local/cargo/registry \
+    cosmwasm/optimizer:0.17.0
