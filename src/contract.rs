@@ -1416,4 +1416,72 @@ mod tests {
         let ownership = cw_ownable::get_ownership(&deps.storage).unwrap();
         assert_eq!(ownership.owner, Some(new_owner));
     }
+
+    // ---------------------------------------------------------------------------
+    // validate_url tests
+    // ---------------------------------------------------------------------------
+
+    fn try_create_ask_url(deps: DepsMut, url: &str) -> Result<Response, ContractError> {
+        execute(
+            deps,
+            mock_env(),
+            message_info(&addr("client"), &[]),
+            ExecuteMsg::CreateAsk {
+                budget: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(100),
+                },
+                metadata_url: url.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn test_metadata_url_valid_schemes() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        // All three supported schemes must pass
+        assert!(try_create_ask_url(deps.as_mut(), "https://example.com/meta.json").is_ok());
+        assert!(try_create_ask_url(deps.as_mut(), "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi").is_ok());
+        assert!(try_create_ask_url(deps.as_mut(), "ar://abc123").is_ok());
+    }
+
+    #[test]
+    fn test_metadata_url_empty_rejected() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let err = try_create_ask_url(deps.as_mut(), "").unwrap_err();
+        assert!(matches!(err, ContractError::InvalidMetadataUrl {}));
+    }
+
+    #[test]
+    fn test_metadata_url_too_long_rejected() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let long_url = format!("https://example.com/{}", "a".repeat(MAX_METADATA_URL_LEN));
+        let err = try_create_ask_url(deps.as_mut(), &long_url).unwrap_err();
+        assert!(matches!(err, ContractError::InvalidMetadataUrl {}));
+    }
+
+    #[test]
+    fn test_metadata_url_unsupported_scheme_rejected() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        for bad_url in &[
+            "http://example.com/meta.json",   // http not allowed
+            "ftp://example.com/meta.json",    // ftp not allowed
+            "example.com/meta.json",          // no scheme
+            "//example.com/meta.json",        // scheme-relative
+        ] {
+            let err = try_create_ask_url(deps.as_mut(), bad_url).unwrap_err();
+            assert!(
+                matches!(err, ContractError::InvalidMetadataUrl {}),
+                "expected rejection for: {bad_url}"
+            );
+        }
+    }
 }
