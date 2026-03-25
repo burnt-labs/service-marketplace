@@ -15,7 +15,8 @@ pub enum AskStatus {
 pub struct Ask {
     pub id: String,
     pub creator: Addr,
-    pub budget: Coin, // informational — guides provider pricing
+    pub budget: Coin,
+    pub metadata_url: String,
     pub status: AskStatus,
     pub selected_bid: Option<String>,
     pub locked_funds: Option<Coin>, // set when SelectBid is executed

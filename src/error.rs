@@ -51,4 +51,7 @@ pub enum ContractError {
 
     #[error("Ask creator cannot bid on their own ask")]
     CreatorCannotBid {},
+
+    #[error("Invalid metadata URL")]
+    InvalidMetadataUrl {},
 }
