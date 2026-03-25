@@ -44,9 +44,10 @@ pub fn execute(
             let ownership = cw_ownable::update_ownership(deps, &env.block, &info.sender, action)?;
             Ok(Response::new().add_attributes(ownership.into_attributes()))
         }
-        ExecuteMsg::CreateAsk { budget, metadata_url } => {
-            create_ask(deps, env, info, budget, metadata_url)
-        }
+        ExecuteMsg::CreateAsk {
+            budget,
+            metadata_url,
+        } => create_ask(deps, env, info, budget, metadata_url),
         ExecuteMsg::SubmitBid {
             ask_id,
             price,
@@ -1443,7 +1444,13 @@ mod tests {
 
         // All three supported schemes must pass
         assert!(try_create_ask_url(deps.as_mut(), "https://example.com/meta.json").is_ok());
-        assert!(try_create_ask_url(deps.as_mut(), "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi").is_ok());
+        assert!(
+            try_create_ask_url(
+                deps.as_mut(),
+                "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+            )
+            .is_ok()
+        );
         assert!(try_create_ask_url(deps.as_mut(), "ar://abc123").is_ok());
     }
 
@@ -1472,10 +1479,10 @@ mod tests {
         setup(deps.as_mut());
 
         for bad_url in &[
-            "http://example.com/meta.json",   // http not allowed
-            "ftp://example.com/meta.json",    // ftp not allowed
-            "example.com/meta.json",          // no scheme
-            "//example.com/meta.json",        // scheme-relative
+            "http://example.com/meta.json", // http not allowed
+            "ftp://example.com/meta.json",  // ftp not allowed
+            "example.com/meta.json",        // no scheme
+            "//example.com/meta.json",      // scheme-relative
         ] {
             let err = try_create_ask_url(deps.as_mut(), bad_url).unwrap_err();
             assert!(
