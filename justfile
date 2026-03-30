@@ -21,3 +21,7 @@ optimize:
     --mount type=volume,source="$(basename "$(pwd)")_cache",target=/target \
     --mount type=volume,source=registry_cache,target=/usr/local/cargo/registry \
     cosmwasm/optimizer:0.17.0
+
+schema:
+    @echo "Generating schema..."
+    cargo schema

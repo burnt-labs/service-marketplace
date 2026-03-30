@@ -44,7 +44,10 @@ pub fn execute(
             let ownership = cw_ownable::update_ownership(deps, &env.block, &info.sender, action)?;
             Ok(Response::new().add_attributes(ownership.into_attributes()))
         }
-        ExecuteMsg::CreateAsk { budget } => create_ask(deps, env, info, budget),
+        ExecuteMsg::CreateAsk {
+            budget,
+            metadata_url,
+        } => create_ask(deps, env, info, budget, metadata_url),
         ExecuteMsg::SubmitBid {
             ask_id,
             price,
@@ -92,11 +95,25 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     }
 }
 
+/// Maximum length for metadata_url (2048 chars — standard browser URL limit)
+const MAX_METADATA_URL_LEN: usize = 2048;
+
+fn validate_url(url: &str) -> Result<(), ContractError> {
+    if url.is_empty() || url.len() > MAX_METADATA_URL_LEN {
+        return Err(ContractError::InvalidMetadataUrl {});
+    }
+    if !url.starts_with("https://") && !url.starts_with("ipfs://") && !url.starts_with("ar://") {
+        return Err(ContractError::InvalidMetadataUrl {});
+    }
+    Ok(())
+}
+
 fn create_ask(
     deps: DepsMut,
     env: Env,
     info: MessageInfo,
     budget: Coin,
+    metadata_url: String,
 ) -> Result<Response, ContractError> {
     nonpayable(&info)?;
 
@@ -113,11 +130,14 @@ fn create_ask(
         });
     }
 
+    validate_url(&metadata_url)?;
+
     let id = next_ask_id(deps.storage, &env, &info)?;
     let ask = Ask {
         id: id.clone(),
         creator: info.sender,
         budget,
+        metadata_url,
         status: AskStatus::Open,
         selected_bid: None,
         locked_funds: None,
@@ -670,6 +690,7 @@ mod tests {
                     denom: DENOM.to_string(),
                     amount: Uint128::new(100),
                 },
+                metadata_url: "https://example.com/ask-metadata.json".to_string(),
             },
         )
         .unwrap();
@@ -1395,5 +1416,79 @@ mod tests {
 
         let ownership = cw_ownable::get_ownership(&deps.storage).unwrap();
         assert_eq!(ownership.owner, Some(new_owner));
+    }
+
+    // ---------------------------------------------------------------------------
+    // validate_url tests
+    // ---------------------------------------------------------------------------
+
+    fn try_create_ask_url(deps: DepsMut, url: &str) -> Result<Response, ContractError> {
+        execute(
+            deps,
+            mock_env(),
+            message_info(&addr("client"), &[]),
+            ExecuteMsg::CreateAsk {
+                budget: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(100),
+                },
+                metadata_url: url.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn test_metadata_url_valid_schemes() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        // All three supported schemes must pass
+        assert!(try_create_ask_url(deps.as_mut(), "https://example.com/meta.json").is_ok());
+        assert!(
+            try_create_ask_url(
+                deps.as_mut(),
+                "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+            )
+            .is_ok()
+        );
+        assert!(try_create_ask_url(deps.as_mut(), "ar://abc123").is_ok());
+    }
+
+    #[test]
+    fn test_metadata_url_empty_rejected() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let err = try_create_ask_url(deps.as_mut(), "").unwrap_err();
+        assert!(matches!(err, ContractError::InvalidMetadataUrl {}));
+    }
+
+    #[test]
+    fn test_metadata_url_too_long_rejected() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let long_url = format!("https://example.com/{}", "a".repeat(MAX_METADATA_URL_LEN));
+        let err = try_create_ask_url(deps.as_mut(), &long_url).unwrap_err();
+        assert!(matches!(err, ContractError::InvalidMetadataUrl {}));
+    }
+
+    #[test]
+    fn test_metadata_url_unsupported_scheme_rejected() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        for bad_url in &[
+            "http://example.com/meta.json", // http not allowed
+            "ftp://example.com/meta.json",  // ftp not allowed
+            "example.com/meta.json",        // no scheme
+            "//example.com/meta.json",      // scheme-relative
+        ] {
+            let err = try_create_ask_url(deps.as_mut(), bad_url).unwrap_err();
+            assert!(
+                matches!(err, ContractError::InvalidMetadataUrl {}),
+                "expected rejection for: {bad_url}"
+            );
+        }
     }
 }

@@ -17,6 +17,7 @@ pub struct InstantiateMsg {
 pub enum ExecuteMsg {
     CreateAsk {
         budget: Coin,
+        metadata_url: String,
     },
     SelectBid {
         ask_id: String,
