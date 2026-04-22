@@ -41,6 +41,7 @@ pub fn execute(
 ) -> Result<Response, ContractError> {
     match msg {
         ExecuteMsg::UpdateOwnership(action) => {
+            nonpayable(&info)?;
             if matches!(action, cw_ownable::Action::RenounceOwnership) {
                 return Err(ContractError::RenounceDisabled {});
             }
@@ -1419,6 +1420,35 @@ mod tests {
 
         let ownership = cw_ownable::get_ownership(&deps.storage).unwrap();
         assert_eq!(ownership.owner, Some(new_owner));
+    }
+
+    #[test]
+    fn test_update_ownership_rejects_funds() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+        let new_owner = addr("new_owner");
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[Coin::new(Uint128::new(1_000), DENOM)]),
+            ExecuteMsg::UpdateOwnership(cw_ownable::Action::TransferOwnership {
+                new_owner: new_owner.to_string(),
+                expiry: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ContractError::Payment(cw_utils::PaymentError::NonPayable {})
+        ));
+
+        // Ownership state must be untouched.
+        let ownership = cw_ownable::get_ownership(&deps.storage).unwrap();
+        assert_eq!(ownership.owner, Some(owner));
+        assert_eq!(ownership.pending_owner, None);
     }
 
     #[test]
