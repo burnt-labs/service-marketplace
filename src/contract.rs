@@ -41,6 +41,9 @@ pub fn execute(
 ) -> Result<Response, ContractError> {
     match msg {
         ExecuteMsg::UpdateOwnership(action) => {
+            if matches!(action, cw_ownable::Action::RenounceOwnership) {
+                return Err(ContractError::RenounceDisabled {});
+            }
             let ownership = cw_ownable::update_ownership(deps, &env.block, &info.sender, action)?;
             Ok(Response::new().add_attributes(ownership.into_attributes()))
         }
@@ -1416,6 +1419,27 @@ mod tests {
 
         let ownership = cw_ownable::get_ownership(&deps.storage).unwrap();
         assert_eq!(ownership.owner, Some(new_owner));
+    }
+
+    #[test]
+    fn test_renounce_ownership_rejected() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::UpdateOwnership(cw_ownable::Action::RenounceOwnership),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::RenounceDisabled {}));
+
+        // Ownership must still be intact after the rejected renunciation.
+        let ownership = cw_ownable::get_ownership(&deps.storage).unwrap();
+        assert_eq!(ownership.owner, Some(owner));
     }
 
     // ---------------------------------------------------------------------------

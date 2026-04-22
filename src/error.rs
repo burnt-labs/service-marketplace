@@ -54,4 +54,7 @@ pub enum ContractError {
 
     #[error("Invalid metadata URL")]
     InvalidMetadataUrl {},
+
+    #[error("Ownership renunciation is disabled")]
+    RenounceDisabled {},
 }
