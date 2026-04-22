@@ -10,7 +10,9 @@ use cw_utils::{must_pay, nonpayable};
 use cw2::set_contract_version;
 
 use crate::error::ContractError;
-use crate::helpers::{assert_creator, next_ask_id, next_bid_id};
+use crate::helpers::{
+    assert_creator, next_ask_id, next_bid_id, validate_allowed_denoms, validate_payout_address,
+};
 use crate::msg::{AskResponse, BidResponse, ExecuteMsg, InstantiateMsg, QueryMsg, RecipientShare};
 use crate::state::{ALLOWED_DENOMS, ASKS, Ask, AskStatus, Bid, bids};
 
@@ -28,6 +30,7 @@ pub fn instantiate(
     nonpayable(&info)?;
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
     cw_ownable::initialize_owner(deps.storage, deps.api, Some(msg.owner.as_str()))?;
+    validate_allowed_denoms(&msg.allowed_denoms)?;
     ALLOWED_DENOMS.save(deps.storage, &msg.allowed_denoms)?;
     Ok(Response::new().add_attribute("action", "instantiate"))
 }
@@ -41,6 +44,10 @@ pub fn execute(
 ) -> Result<Response, ContractError> {
     match msg {
         ExecuteMsg::UpdateOwnership(action) => {
+            nonpayable(&info)?;
+            if matches!(action, cw_ownable::Action::RenounceOwnership) {
+                return Err(ContractError::RenounceDisabled {});
+            }
             let ownership = cw_ownable::update_ownership(deps, &env.block, &info.sender, action)?;
             Ok(Response::new().add_attributes(ownership.into_attributes()))
         }
@@ -65,12 +72,14 @@ pub fn execute(
             partial_disbursement(deps, info, ask_id, amount)
         }
         ExecuteMsg::AdminCancel { ask_id, refund_to } => {
-            admin_cancel(deps, info, ask_id, refund_to)
+            admin_cancel(deps, env, info, ask_id, refund_to)
         }
         ExecuteMsg::AdminForceRelease { ask_id, recipient } => {
-            admin_force_release(deps, info, ask_id, recipient)
+            admin_force_release(deps, env, info, ask_id, recipient)
         }
-        ExecuteMsg::AdminResolve { ask_id, splits } => admin_resolve(deps, info, ask_id, splits),
+        ExecuteMsg::AdminResolve { ask_id, splits } => {
+            admin_resolve(deps, env, info, ask_id, splits)
+        }
         ExecuteMsg::AdminSetAllowedDenoms { denoms } => {
             admin_set_allowed_denoms(deps, info, denoms)
         }
@@ -124,7 +133,7 @@ fn create_ask(
     }
 
     let allowed = ALLOWED_DENOMS.load(deps.storage)?;
-    if !allowed.is_empty() && !allowed.contains(&budget.denom) {
+    if !allowed.contains(&budget.denom) {
         return Err(ContractError::DenomNotAllowed {
             denom: budget.denom,
         });
@@ -192,7 +201,7 @@ fn submit_bid(
     }
 
     let funds_recipient = funds_recipient
-        .map(|r| deps.api.addr_validate(&r))
+        .map(|r| validate_payout_address(deps.api, &env, &r))
         .transpose()?;
 
     let id = next_bid_id(deps.storage, &env, &info)?;
@@ -417,7 +426,7 @@ fn partial_disbursement(
         .as_mut()
         .ok_or(ContractError::InsufficientFunds {})?;
 
-    if amount.amount.is_zero() || amount.amount > locked.amount {
+    if amount.amount.is_zero() || amount.amount >= locked.amount {
         return Err(ContractError::InsufficientFunds {});
     }
 
@@ -435,6 +444,7 @@ fn partial_disbursement(
 
 fn admin_cancel(
     deps: DepsMut,
+    env: Env,
     info: MessageInfo,
     ask_id: String,
     refund_to: String,
@@ -453,7 +463,7 @@ fn admin_cancel(
         });
     }
 
-    let refund_addr = deps.api.addr_validate(&refund_to)?;
+    let refund_addr = validate_payout_address(deps.api, &env, &refund_to)?;
     let mut msgs = vec![];
     if let Some(locked) = ask.locked_funds.take() {
         if !locked.amount.is_zero() {
@@ -475,6 +485,7 @@ fn admin_cancel(
 
 fn admin_force_release(
     deps: DepsMut,
+    env: Env,
     info: MessageInfo,
     ask_id: String,
     recipient: String,
@@ -486,14 +497,14 @@ fn admin_force_release(
         .load(deps.storage, &ask_id)
         .map_err(|_| ContractError::AskNotFound { id: ask_id.clone() })?;
 
-    if matches!(ask.status, AskStatus::Completed | AskStatus::Cancelled) {
+    if !matches!(ask.status, AskStatus::InProgress | AskStatus::WorkSubmitted) {
         return Err(ContractError::InvalidStatus {
-            expected: "any active status".to_string(),
+            expected: "InProgress or WorkSubmitted".to_string(),
             got: format!("{:?}", ask.status),
         });
     }
 
-    let recipient_addr = deps.api.addr_validate(&recipient)?;
+    let recipient_addr = validate_payout_address(deps.api, &env, &recipient)?;
     let mut msgs = vec![];
     if let Some(locked) = ask.locked_funds.take() {
         if !locked.amount.is_zero() {
@@ -515,6 +526,7 @@ fn admin_force_release(
 
 fn admin_resolve(
     deps: DepsMut,
+    env: Env,
     info: MessageInfo,
     ask_id: String,
     splits: Vec<RecipientShare>,
@@ -565,7 +577,7 @@ fn admin_resolve(
 
     let mut msgs = vec![];
     for split in splits {
-        let addr = deps.api.addr_validate(&split.recipient)?;
+        let addr = validate_payout_address(deps.api, &env, &split.recipient)?;
         msgs.push(BankMsg::Send {
             to_address: addr.to_string(),
             amount: vec![Coin {
@@ -591,6 +603,7 @@ fn admin_set_allowed_denoms(
 ) -> Result<Response, ContractError> {
     nonpayable(&info)?;
     assert_owner(deps.storage, &info.sender)?;
+    validate_allowed_denoms(&denoms)?;
     ALLOWED_DENOMS.save(deps.storage, &denoms)?;
     Ok(Response::new().add_attribute("action", "admin_set_allowed_denoms"))
 }
@@ -674,7 +687,7 @@ mod tests {
         let owner = addr("owner");
         let msg = InstantiateMsg {
             owner: owner.to_string(),
-            allowed_denoms: vec![],
+            allowed_denoms: vec![DENOM.to_string()],
         };
         instantiate(deps, mock_env(), message_info(&owner, &[]), msg).unwrap();
     }
@@ -1301,6 +1314,364 @@ mod tests {
     }
 
     #[test]
+    fn test_submit_bid_rejects_self_targeted_funds_recipient() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let provider = addr("provider");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&provider, &[]),
+            ExecuteMsg::SubmitBid {
+                ask_id,
+                price: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(80),
+                },
+                funds_recipient: Some(mock_env().contract.address.to_string()),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidPayoutAddress {}));
+    }
+
+    #[test]
+    fn test_admin_cancel_rejects_self_targeted_refund() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+        let client = addr("client");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+        let bid_id = submit_bid_and_get_id(deps.as_mut(), &ask_id, "provider", 80);
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &coins(80, DENOM)),
+            ExecuteMsg::SelectBid {
+                ask_id: ask_id.clone(),
+                bid_id,
+                expected_price: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(80),
+                },
+            },
+        )
+        .unwrap();
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::AdminCancel {
+                ask_id: ask_id.clone(),
+                refund_to: mock_env().contract.address.to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidPayoutAddress {}));
+
+        // Escrow must remain intact after the rejection.
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert!(matches!(ask.status, AskStatus::InProgress));
+        assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(80));
+    }
+
+    #[test]
+    fn test_admin_force_release_rejects_self_targeted_recipient() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+        let client = addr("client");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+        let bid_id = submit_bid_and_get_id(deps.as_mut(), &ask_id, "provider", 80);
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &coins(80, DENOM)),
+            ExecuteMsg::SelectBid {
+                ask_id: ask_id.clone(),
+                bid_id,
+                expected_price: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(80),
+                },
+            },
+        )
+        .unwrap();
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::AdminForceRelease {
+                ask_id: ask_id.clone(),
+                recipient: mock_env().contract.address.to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidPayoutAddress {}));
+
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert!(matches!(ask.status, AskStatus::InProgress));
+        assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(80));
+    }
+
+    #[test]
+    fn test_admin_resolve_rejects_self_targeted_split() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+        let client = addr("client");
+        let provider = addr("provider");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+        let bid_id = submit_bid_and_get_id(deps.as_mut(), &ask_id, "provider", 100);
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &coins(100, DENOM)),
+            ExecuteMsg::SelectBid {
+                ask_id: ask_id.clone(),
+                bid_id,
+                expected_price: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(100),
+                },
+            },
+        )
+        .unwrap();
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::AdminResolve {
+                ask_id: ask_id.clone(),
+                splits: vec![
+                    RecipientShare {
+                        recipient: provider.to_string(),
+                        amount: Uint128::new(60),
+                    },
+                    RecipientShare {
+                        recipient: mock_env().contract.address.to_string(),
+                        amount: Uint128::new(40),
+                    },
+                ],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidPayoutAddress {}));
+
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert!(matches!(ask.status, AskStatus::InProgress));
+        assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(100));
+    }
+
+    #[test]
+    fn test_partial_disbursement_cannot_fully_drain() {
+        // PartialDisbursement must keep the escrow strictly positive so the full
+        // set of terminal admin paths (including AdminResolve, which rejects
+        // zero-amount splits) remains reachable for the remaining balance.
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let client = addr("client");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+        let bid_id = submit_bid_and_get_id(deps.as_mut(), &ask_id, "provider", 100);
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &coins(100, DENOM)),
+            ExecuteMsg::SelectBid {
+                ask_id: ask_id.clone(),
+                bid_id,
+                expected_price: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(100),
+                },
+            },
+        )
+        .unwrap();
+
+        // Attempting to drain the full 100 must fail.
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &[]),
+            ExecuteMsg::PartialDisbursement {
+                ask_id: ask_id.clone(),
+                amount: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(100),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InsufficientFunds {}));
+
+        // Escrow state must be untouched.
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert!(matches!(ask.status, AskStatus::InProgress));
+        assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(100));
+
+        // One wei less than the balance still works, leaving dust behind.
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &[]),
+            ExecuteMsg::PartialDisbursement {
+                ask_id: ask_id.clone(),
+                amount: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(99),
+                },
+            },
+        )
+        .unwrap();
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(1));
+    }
+
+    #[test]
+    fn test_instantiate_rejects_empty_allowed_denoms() {
+        let mut deps = mock_dependencies();
+        let owner = addr("owner");
+        let err = instantiate(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            InstantiateMsg {
+                owner: owner.to_string(),
+                allowed_denoms: vec![],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidAllowedDenoms {}));
+    }
+
+    #[test]
+    fn test_instantiate_rejects_empty_string_denom() {
+        let mut deps = mock_dependencies();
+        let owner = addr("owner");
+        let err = instantiate(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            InstantiateMsg {
+                owner: owner.to_string(),
+                allowed_denoms: vec![DENOM.to_string(), String::new()],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidAllowedDenoms {}));
+    }
+
+    #[test]
+    fn test_instantiate_rejects_duplicate_denoms() {
+        let mut deps = mock_dependencies();
+        let owner = addr("owner");
+        let err = instantiate(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            InstantiateMsg {
+                owner: owner.to_string(),
+                allowed_denoms: vec![DENOM.to_string(), DENOM.to_string()],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidAllowedDenoms {}));
+    }
+
+    #[test]
+    fn test_admin_set_allowed_denoms_rejects_invalid_lists() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+        let owner = addr("owner");
+
+        for denoms in [
+            vec![],
+            vec![String::new()],
+            vec!["uatom".to_string(), "uatom".to_string()],
+            vec!["uatom".to_string(), String::new()],
+        ] {
+            let err = execute(
+                deps.as_mut(),
+                mock_env(),
+                message_info(&owner, &[]),
+                ExecuteMsg::AdminSetAllowedDenoms {
+                    denoms: denoms.clone(),
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ContractError::InvalidAllowedDenoms {}),
+                "expected InvalidAllowedDenoms for {denoms:?}"
+            );
+        }
+
+        // The stored list must still be the one from setup, not any rejected input.
+        let stored = query_allowed_denoms(deps.as_ref()).unwrap();
+        assert_eq!(stored, vec![DENOM.to_string()]);
+    }
+
+    #[test]
+    fn test_admin_set_allowed_denoms_accepts_valid_list() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+        let owner = addr("owner");
+
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::AdminSetAllowedDenoms {
+                denoms: vec!["uatom".to_string(), "uusdc".to_string()],
+            },
+        )
+        .unwrap();
+
+        let stored = query_allowed_denoms(deps.as_ref()).unwrap();
+        assert_eq!(stored, vec!["uatom".to_string(), "uusdc".to_string()]);
+    }
+
+    #[test]
+    fn test_admin_force_release_rejects_open_ask() {
+        // AdminForceRelease must only operate on escrow-holding asks. An Open
+        // ask has no selected bid and no locked_funds, so silently moving it
+        // to Completed would mislead indexers and front-ends.
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+        let provider = addr("provider");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::AdminForceRelease {
+                ask_id: ask_id.clone(),
+                recipient: provider.to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidStatus { .. }));
+
+        // Ask must still be Open after the rejection.
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert!(matches!(ask.status, AskStatus::Open));
+        assert!(ask.selected_bid.is_none());
+        assert!(ask.locked_funds.is_none());
+    }
+
+    #[test]
     fn test_query_list_bids_by_ask() {
         let mut deps = mock_dependencies();
         setup(deps.as_mut());
@@ -1416,6 +1787,56 @@ mod tests {
 
         let ownership = cw_ownable::get_ownership(&deps.storage).unwrap();
         assert_eq!(ownership.owner, Some(new_owner));
+    }
+
+    #[test]
+    fn test_update_ownership_rejects_funds() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+        let new_owner = addr("new_owner");
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[Coin::new(Uint128::new(1_000), DENOM)]),
+            ExecuteMsg::UpdateOwnership(cw_ownable::Action::TransferOwnership {
+                new_owner: new_owner.to_string(),
+                expiry: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ContractError::Payment(cw_utils::PaymentError::NonPayable {})
+        ));
+
+        // Ownership state must be untouched.
+        let ownership = cw_ownable::get_ownership(&deps.storage).unwrap();
+        assert_eq!(ownership.owner, Some(owner));
+        assert_eq!(ownership.pending_owner, None);
+    }
+
+    #[test]
+    fn test_renounce_ownership_rejected() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::UpdateOwnership(cw_ownable::Action::RenounceOwnership),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::RenounceDisabled {}));
+
+        // Ownership must still be intact after the rejected renunciation.
+        let ownership = cw_ownable::get_ownership(&deps.storage).unwrap();
+        assert_eq!(ownership.owner, Some(owner));
     }
 
     // ---------------------------------------------------------------------------

@@ -54,4 +54,13 @@ pub enum ContractError {
 
     #[error("Invalid metadata URL")]
     InvalidMetadataUrl {},
+
+    #[error("Ownership renunciation is disabled")]
+    RenounceDisabled {},
+
+    #[error("Invalid payout address")]
+    InvalidPayoutAddress {},
+
+    #[error("Invalid allowed_denoms: must be non-empty, no empty strings, no duplicates")]
+    InvalidAllowedDenoms {},
 }
