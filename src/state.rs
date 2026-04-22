@@ -66,5 +66,6 @@ pub const BID_COUNT: Item<u64> = Item::new("bid_count");
 
 pub const ASKS: Map<&str, Ask> = Map::new("asks");
 
-/// Allowlisted payment denoms. Empty = all denoms accepted.
+/// Allowlisted payment denoms. Must be non-empty and contain no duplicates
+/// (enforced by `validate_allowed_denoms` at instantiation and on updates).
 pub const ALLOWED_DENOMS: Item<Vec<String>> = Item::new("allowed_denoms");

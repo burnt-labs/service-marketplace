@@ -10,7 +10,9 @@ use cw_utils::{must_pay, nonpayable};
 use cw2::set_contract_version;
 
 use crate::error::ContractError;
-use crate::helpers::{assert_creator, next_ask_id, next_bid_id, validate_payout_address};
+use crate::helpers::{
+    assert_creator, next_ask_id, next_bid_id, validate_allowed_denoms, validate_payout_address,
+};
 use crate::msg::{AskResponse, BidResponse, ExecuteMsg, InstantiateMsg, QueryMsg, RecipientShare};
 use crate::state::{ALLOWED_DENOMS, ASKS, Ask, AskStatus, Bid, bids};
 
@@ -28,6 +30,7 @@ pub fn instantiate(
     nonpayable(&info)?;
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
     cw_ownable::initialize_owner(deps.storage, deps.api, Some(msg.owner.as_str()))?;
+    validate_allowed_denoms(&msg.allowed_denoms)?;
     ALLOWED_DENOMS.save(deps.storage, &msg.allowed_denoms)?;
     Ok(Response::new().add_attribute("action", "instantiate"))
 }
@@ -130,7 +133,7 @@ fn create_ask(
     }
 
     let allowed = ALLOWED_DENOMS.load(deps.storage)?;
-    if !allowed.is_empty() && !allowed.contains(&budget.denom) {
+    if !allowed.contains(&budget.denom) {
         return Err(ContractError::DenomNotAllowed {
             denom: budget.denom,
         });
@@ -423,7 +426,7 @@ fn partial_disbursement(
         .as_mut()
         .ok_or(ContractError::InsufficientFunds {})?;
 
-    if amount.amount.is_zero() || amount.amount > locked.amount {
+    if amount.amount.is_zero() || amount.amount >= locked.amount {
         return Err(ContractError::InsufficientFunds {});
     }
 
@@ -494,9 +497,9 @@ fn admin_force_release(
         .load(deps.storage, &ask_id)
         .map_err(|_| ContractError::AskNotFound { id: ask_id.clone() })?;
 
-    if matches!(ask.status, AskStatus::Completed | AskStatus::Cancelled) {
+    if !matches!(ask.status, AskStatus::InProgress | AskStatus::WorkSubmitted) {
         return Err(ContractError::InvalidStatus {
-            expected: "any active status".to_string(),
+            expected: "InProgress or WorkSubmitted".to_string(),
             got: format!("{:?}", ask.status),
         });
     }
@@ -600,6 +603,7 @@ fn admin_set_allowed_denoms(
 ) -> Result<Response, ContractError> {
     nonpayable(&info)?;
     assert_owner(deps.storage, &info.sender)?;
+    validate_allowed_denoms(&denoms)?;
     ALLOWED_DENOMS.save(deps.storage, &denoms)?;
     Ok(Response::new().add_attribute("action", "admin_set_allowed_denoms"))
 }
@@ -683,7 +687,7 @@ mod tests {
         let owner = addr("owner");
         let msg = InstantiateMsg {
             owner: owner.to_string(),
-            allowed_denoms: vec![],
+            allowed_denoms: vec![DENOM.to_string()],
         };
         instantiate(deps, mock_env(), message_info(&owner, &[]), msg).unwrap();
     }
@@ -1466,6 +1470,205 @@ mod tests {
         let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
         assert!(matches!(ask.status, AskStatus::InProgress));
         assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(100));
+    }
+
+    #[test]
+    fn test_partial_disbursement_cannot_fully_drain() {
+        // PartialDisbursement must keep the escrow strictly positive so the full
+        // set of terminal admin paths (including AdminResolve, which rejects
+        // zero-amount splits) remains reachable for the remaining balance.
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let client = addr("client");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+        let bid_id = submit_bid_and_get_id(deps.as_mut(), &ask_id, "provider", 100);
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &coins(100, DENOM)),
+            ExecuteMsg::SelectBid {
+                ask_id: ask_id.clone(),
+                bid_id,
+                expected_price: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(100),
+                },
+            },
+        )
+        .unwrap();
+
+        // Attempting to drain the full 100 must fail.
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &[]),
+            ExecuteMsg::PartialDisbursement {
+                ask_id: ask_id.clone(),
+                amount: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(100),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InsufficientFunds {}));
+
+        // Escrow state must be untouched.
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert!(matches!(ask.status, AskStatus::InProgress));
+        assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(100));
+
+        // One wei less than the balance still works, leaving dust behind.
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &[]),
+            ExecuteMsg::PartialDisbursement {
+                ask_id: ask_id.clone(),
+                amount: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(99),
+                },
+            },
+        )
+        .unwrap();
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(1));
+    }
+
+    #[test]
+    fn test_instantiate_rejects_empty_allowed_denoms() {
+        let mut deps = mock_dependencies();
+        let owner = addr("owner");
+        let err = instantiate(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            InstantiateMsg {
+                owner: owner.to_string(),
+                allowed_denoms: vec![],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidAllowedDenoms {}));
+    }
+
+    #[test]
+    fn test_instantiate_rejects_empty_string_denom() {
+        let mut deps = mock_dependencies();
+        let owner = addr("owner");
+        let err = instantiate(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            InstantiateMsg {
+                owner: owner.to_string(),
+                allowed_denoms: vec![DENOM.to_string(), String::new()],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidAllowedDenoms {}));
+    }
+
+    #[test]
+    fn test_instantiate_rejects_duplicate_denoms() {
+        let mut deps = mock_dependencies();
+        let owner = addr("owner");
+        let err = instantiate(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            InstantiateMsg {
+                owner: owner.to_string(),
+                allowed_denoms: vec![DENOM.to_string(), DENOM.to_string()],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidAllowedDenoms {}));
+    }
+
+    #[test]
+    fn test_admin_set_allowed_denoms_rejects_invalid_lists() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+        let owner = addr("owner");
+
+        for denoms in [
+            vec![],
+            vec![String::new()],
+            vec!["uatom".to_string(), "uatom".to_string()],
+            vec!["uatom".to_string(), String::new()],
+        ] {
+            let err = execute(
+                deps.as_mut(),
+                mock_env(),
+                message_info(&owner, &[]),
+                ExecuteMsg::AdminSetAllowedDenoms {
+                    denoms: denoms.clone(),
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ContractError::InvalidAllowedDenoms {}),
+                "expected InvalidAllowedDenoms for {denoms:?}"
+            );
+        }
+
+        // The stored list must still be the one from setup, not any rejected input.
+        let stored = query_allowed_denoms(deps.as_ref()).unwrap();
+        assert_eq!(stored, vec![DENOM.to_string()]);
+    }
+
+    #[test]
+    fn test_admin_set_allowed_denoms_accepts_valid_list() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+        let owner = addr("owner");
+
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::AdminSetAllowedDenoms {
+                denoms: vec!["uatom".to_string(), "uusdc".to_string()],
+            },
+        )
+        .unwrap();
+
+        let stored = query_allowed_denoms(deps.as_ref()).unwrap();
+        assert_eq!(stored, vec!["uatom".to_string(), "uusdc".to_string()]);
+    }
+
+    #[test]
+    fn test_admin_force_release_rejects_open_ask() {
+        // AdminForceRelease must only operate on escrow-holding asks. An Open
+        // ask has no selected bid and no locked_funds, so silently moving it
+        // to Completed would mislead indexers and front-ends.
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+        let provider = addr("provider");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::AdminForceRelease {
+                ask_id: ask_id.clone(),
+                recipient: provider.to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidStatus { .. }));
+
+        // Ask must still be Open after the rejection.
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert!(matches!(ask.status, AskStatus::Open));
+        assert!(ask.selected_bid.is_none());
+        assert!(ask.locked_funds.is_none());
     }
 
     #[test]

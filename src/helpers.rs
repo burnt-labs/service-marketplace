@@ -5,6 +5,23 @@ use cw_ownable::assert_owner;
 use crate::ContractError;
 use crate::state::{ASK_COUNT, Ask, BID_COUNT};
 
+/// Validate an `allowed_denoms` list: must be non-empty, contain no empty
+/// strings, and contain no duplicates. Returning an error here is preferable
+/// to silently normalizing because the caller's intent is ambiguous if, say,
+/// they passed two copies of the same denom.
+pub fn validate_allowed_denoms(denoms: &[String]) -> Result<(), ContractError> {
+    if denoms.is_empty() {
+        return Err(ContractError::InvalidAllowedDenoms {});
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for d in denoms {
+        if d.is_empty() || !seen.insert(d.as_str()) {
+            return Err(ContractError::InvalidAllowedDenoms {});
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_payout_address(
     api: &dyn Api,
     env: &Env,
@@ -17,9 +34,17 @@ pub fn validate_payout_address(
     Ok(addr)
 }
 
+/// Domain separator between pre-image fields. `|` (0x7C) is outside the
+/// bech32 charset and the decimal digit set, so no input component can
+/// produce a byte sequence that collides with the separator.
+const ID_FIELD_SEPARATOR: &[u8] = b"|";
+
 pub fn generate_id(parts: Vec<&[u8]>) -> String {
     let mut hasher = Blake2s256::new();
-    for part in parts {
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            hasher.update(ID_FIELD_SEPARATOR);
+        }
         hasher.update(part);
     }
     format!("{:x}", hasher.finalize())
@@ -100,4 +125,18 @@ pub fn assert_owner_or_creator(
         return Ok(());
     }
     assert_owner(storage, &info.sender).map_err(|_| ContractError::NotOwnerOrCreator {})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_id_disambiguates_adjacent_fields() {
+        // Without a separator the two tuples below produce the same
+        // concatenated pre-image ("ask" + "12" + "345" == "ask" + "123" + "45").
+        let a = generate_id(vec![b"ask", b"12", b"345"]);
+        let b = generate_id(vec![b"ask", b"123", b"45"]);
+        assert_ne!(a, b);
+    }
 }

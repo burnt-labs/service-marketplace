@@ -60,4 +60,7 @@ pub enum ContractError {
 
     #[error("Invalid payout address")]
     InvalidPayoutAddress {},
+
+    #[error("Invalid allowed_denoms: must be non-empty, no empty strings, no duplicates")]
+    InvalidAllowedDenoms {},
 }
