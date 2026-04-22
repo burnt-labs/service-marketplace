@@ -57,4 +57,7 @@ pub enum ContractError {
 
     #[error("Ownership renunciation is disabled")]
     RenounceDisabled {},
+
+    #[error("Invalid payout address")]
+    InvalidPayoutAddress {},
 }

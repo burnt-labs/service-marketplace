@@ -10,7 +10,7 @@ use cw_utils::{must_pay, nonpayable};
 use cw2::set_contract_version;
 
 use crate::error::ContractError;
-use crate::helpers::{assert_creator, next_ask_id, next_bid_id};
+use crate::helpers::{assert_creator, next_ask_id, next_bid_id, validate_payout_address};
 use crate::msg::{AskResponse, BidResponse, ExecuteMsg, InstantiateMsg, QueryMsg, RecipientShare};
 use crate::state::{ALLOWED_DENOMS, ASKS, Ask, AskStatus, Bid, bids};
 
@@ -69,12 +69,14 @@ pub fn execute(
             partial_disbursement(deps, info, ask_id, amount)
         }
         ExecuteMsg::AdminCancel { ask_id, refund_to } => {
-            admin_cancel(deps, info, ask_id, refund_to)
+            admin_cancel(deps, env, info, ask_id, refund_to)
         }
         ExecuteMsg::AdminForceRelease { ask_id, recipient } => {
-            admin_force_release(deps, info, ask_id, recipient)
+            admin_force_release(deps, env, info, ask_id, recipient)
         }
-        ExecuteMsg::AdminResolve { ask_id, splits } => admin_resolve(deps, info, ask_id, splits),
+        ExecuteMsg::AdminResolve { ask_id, splits } => {
+            admin_resolve(deps, env, info, ask_id, splits)
+        }
         ExecuteMsg::AdminSetAllowedDenoms { denoms } => {
             admin_set_allowed_denoms(deps, info, denoms)
         }
@@ -196,7 +198,7 @@ fn submit_bid(
     }
 
     let funds_recipient = funds_recipient
-        .map(|r| deps.api.addr_validate(&r))
+        .map(|r| validate_payout_address(deps.api, &env, &r))
         .transpose()?;
 
     let id = next_bid_id(deps.storage, &env, &info)?;
@@ -439,6 +441,7 @@ fn partial_disbursement(
 
 fn admin_cancel(
     deps: DepsMut,
+    env: Env,
     info: MessageInfo,
     ask_id: String,
     refund_to: String,
@@ -457,7 +460,7 @@ fn admin_cancel(
         });
     }
 
-    let refund_addr = deps.api.addr_validate(&refund_to)?;
+    let refund_addr = validate_payout_address(deps.api, &env, &refund_to)?;
     let mut msgs = vec![];
     if let Some(locked) = ask.locked_funds.take() {
         if !locked.amount.is_zero() {
@@ -479,6 +482,7 @@ fn admin_cancel(
 
 fn admin_force_release(
     deps: DepsMut,
+    env: Env,
     info: MessageInfo,
     ask_id: String,
     recipient: String,
@@ -497,7 +501,7 @@ fn admin_force_release(
         });
     }
 
-    let recipient_addr = deps.api.addr_validate(&recipient)?;
+    let recipient_addr = validate_payout_address(deps.api, &env, &recipient)?;
     let mut msgs = vec![];
     if let Some(locked) = ask.locked_funds.take() {
         if !locked.amount.is_zero() {
@@ -519,6 +523,7 @@ fn admin_force_release(
 
 fn admin_resolve(
     deps: DepsMut,
+    env: Env,
     info: MessageInfo,
     ask_id: String,
     splits: Vec<RecipientShare>,
@@ -569,7 +574,7 @@ fn admin_resolve(
 
     let mut msgs = vec![];
     for split in splits {
-        let addr = deps.api.addr_validate(&split.recipient)?;
+        let addr = validate_payout_address(deps.api, &env, &split.recipient)?;
         msgs.push(BankMsg::Send {
             to_address: addr.to_string(),
             amount: vec![Coin {
@@ -1302,6 +1307,165 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ContractError::InvalidRecipientsCount { .. }));
+    }
+
+    #[test]
+    fn test_submit_bid_rejects_self_targeted_funds_recipient() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let provider = addr("provider");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&provider, &[]),
+            ExecuteMsg::SubmitBid {
+                ask_id,
+                price: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(80),
+                },
+                funds_recipient: Some(mock_env().contract.address.to_string()),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidPayoutAddress {}));
+    }
+
+    #[test]
+    fn test_admin_cancel_rejects_self_targeted_refund() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+        let client = addr("client");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+        let bid_id = submit_bid_and_get_id(deps.as_mut(), &ask_id, "provider", 80);
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &coins(80, DENOM)),
+            ExecuteMsg::SelectBid {
+                ask_id: ask_id.clone(),
+                bid_id,
+                expected_price: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(80),
+                },
+            },
+        )
+        .unwrap();
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::AdminCancel {
+                ask_id: ask_id.clone(),
+                refund_to: mock_env().contract.address.to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidPayoutAddress {}));
+
+        // Escrow must remain intact after the rejection.
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert!(matches!(ask.status, AskStatus::InProgress));
+        assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(80));
+    }
+
+    #[test]
+    fn test_admin_force_release_rejects_self_targeted_recipient() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+        let client = addr("client");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+        let bid_id = submit_bid_and_get_id(deps.as_mut(), &ask_id, "provider", 80);
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &coins(80, DENOM)),
+            ExecuteMsg::SelectBid {
+                ask_id: ask_id.clone(),
+                bid_id,
+                expected_price: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(80),
+                },
+            },
+        )
+        .unwrap();
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::AdminForceRelease {
+                ask_id: ask_id.clone(),
+                recipient: mock_env().contract.address.to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidPayoutAddress {}));
+
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert!(matches!(ask.status, AskStatus::InProgress));
+        assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(80));
+    }
+
+    #[test]
+    fn test_admin_resolve_rejects_self_targeted_split() {
+        let mut deps = mock_dependencies();
+        setup(deps.as_mut());
+
+        let owner = addr("owner");
+        let client = addr("client");
+        let provider = addr("provider");
+        let ask_id = create_ask_and_get_id(deps.as_mut());
+        let bid_id = submit_bid_and_get_id(deps.as_mut(), &ask_id, "provider", 100);
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&client, &coins(100, DENOM)),
+            ExecuteMsg::SelectBid {
+                ask_id: ask_id.clone(),
+                bid_id,
+                expected_price: Coin {
+                    denom: DENOM.to_string(),
+                    amount: Uint128::new(100),
+                },
+            },
+        )
+        .unwrap();
+
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&owner, &[]),
+            ExecuteMsg::AdminResolve {
+                ask_id: ask_id.clone(),
+                splits: vec![
+                    RecipientShare {
+                        recipient: provider.to_string(),
+                        amount: Uint128::new(60),
+                    },
+                    RecipientShare {
+                        recipient: mock_env().contract.address.to_string(),
+                        amount: Uint128::new(40),
+                    },
+                ],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ContractError::InvalidPayoutAddress {}));
+
+        let ask = ASKS.load(&deps.storage, &ask_id).unwrap();
+        assert!(matches!(ask.status, AskStatus::InProgress));
+        assert_eq!(ask.locked_funds.unwrap().amount, Uint128::new(100));
     }
 
     #[test]

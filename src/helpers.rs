@@ -1,9 +1,21 @@
 use blake2::{Blake2s256, Digest};
-use cosmwasm_std::{Env, MessageInfo, Storage};
+use cosmwasm_std::{Addr, Api, Env, MessageInfo, Storage};
 use cw_ownable::assert_owner;
 
 use crate::ContractError;
 use crate::state::{ASK_COUNT, Ask, BID_COUNT};
+
+pub fn validate_payout_address(
+    api: &dyn Api,
+    env: &Env,
+    raw: &str,
+) -> Result<Addr, ContractError> {
+    let addr = api.addr_validate(raw)?;
+    if addr == env.contract.address {
+        return Err(ContractError::InvalidPayoutAddress {});
+    }
+    Ok(addr)
+}
 
 pub fn generate_id(parts: Vec<&[u8]>) -> String {
     let mut hasher = Blake2s256::new();
