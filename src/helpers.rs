@@ -22,11 +22,7 @@ pub fn validate_allowed_denoms(denoms: &[String]) -> Result<(), ContractError> {
     Ok(())
 }
 
-pub fn validate_payout_address(
-    api: &dyn Api,
-    env: &Env,
-    raw: &str,
-) -> Result<Addr, ContractError> {
+pub fn validate_payout_address(api: &dyn Api, env: &Env, raw: &str) -> Result<Addr, ContractError> {
     let addr = api.addr_validate(raw)?;
     if addr == env.contract.address {
         return Err(ContractError::InvalidPayoutAddress {});
